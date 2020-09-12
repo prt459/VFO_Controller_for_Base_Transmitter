@@ -1,0 +1,733 @@
+/*  
+Arduino Nano script for homebrew AM transmitter.   
+Written by Paul Taylor, VK3HN (https://vk3hn.wordpress.com/) standing on the shoulders of:
+  - Przemek Sadowski, SQ9NJE (basic controller script)
+  - Jason Mildrum NT7S (si5351 library)
+  - too many others to mention (ideas, code snippets). 
+  
+Targets Ashar Farhan VU2ESE's Arduino Nano/si5351 module (Raduino). 
+
+V1.0, 30 Aug 2020 - first version 
+
+*/
+
+#include "HT16K33.h"     // 0.56" 7 segment LED display block controller
+#include <Adafruit_MCP9808.h>  // precision temperature sensor 
+#include <Rotary.h>      // rotary encoder library 
+#include <si5351.h>      // Etherkit si3531 library, V2.0.1   https://github.com/etherkit/Si5351Arduino 
+#include <Wire.h>        // I2C library 
+#include <EEPROM.h>      // EEPROM library 
+
+#include <RTClibNeiroN.h>  // I2C Realtime Clock lib, NeiroN https://www.arduinolibraries.info/libraries/rtc-lib-by-neiro-n
+
+#define ENCODER_B           2   // Encoder pin B
+#define ENCODER_A           3   // Encoder pin A
+#define PTT_SENSE           4   // sense the PTT button being pressed (low == transmit)
+#define MUTE_LINE           5   // receiver mute (high == mute)
+#define TONE_OUT            6   // tone for pip, over-beep and CW ident 
+#define TRANSMIT_LINE       7   // controls the T/R relay (high == transmit)
+#define BAND_80             8   // engage relays for 80m
+#define PWM_ENABLE          9   // enable PWM (which applies drive)
+#define PUSHBUTTON_ENCODER 10   // pushbutton on the encoder
+#define PUSHBUTTON_TOP     11   // pushburron top
+#define PUSHBUTTON_BOTTOM  12   // pushbutton bottom 
+
+#define NBR_VFOS            2   // number of selectable VFOs (one per band) 
+
+// struct for 'VFO parameter set' records -- the parameters that will change with each VFO
+typedef struct {
+  boolean  active;
+  uint32_t vfo;
+  uint32_t radix;
+} VFOset_type;
+
+VFOset_type VFOSet[NBR_VFOS]; // array of band parameter sets
+byte v;                       // index into VFOSet array (representing the current VFO)
+                              // in this transmitter, 0 = 160m VFO, 1 = 80m VFO
+
+
+Si5351 si5351;                // I2C address defaults to x60 in the NT7S lib
+Rotary r = Rotary(ENCODER_A, ENCODER_B);
+bool changed_f = false;       // true if the encoder dial was turned 
+bool mode_tx = false;         // true when transmitting 
+bool band160 = true;          // boot up on 160 
+
+// EEPROM variables
+bool update_eeprom_flag = false;          // flag to inhibit unnecessary EEPROM writes 
+unsigned long last_freq_change_mS = 0;  
+#define EEPROM_UPDATE_LAG_MS  5000        // period of encoder inactivity after which EEPROM update is done
+
+Adafruit_MCP9808 tempSensor = Adafruit_MCP9808();  // I2C address defaults to 0x18
+
+HT16K33 display_left(0x70);
+HT16K33 display_right(0x74);
+
+DS1307 rtc;      // the RTC object
+
+byte transmit_timer_m;   // transmit timer, minutes 
+byte transmit_timer_s;   // transmit timer, seconds
+
+unsigned long this_mS = 0;         // mS counter  
+unsigned long last_mS = millis();  // mS counter  
+unsigned int tick = 0; 
+unsigned int activity_ticks = 1;    // counts the ticks of activity
+unsigned int inactivity_ticks = 1;  // counts the ticks of inactivity
+
+bool user_active = true;   // true if a front panel control has been touched in the last INACTIVE_SECS seconds 
+#define INACTIVE_SECS   7  // period of inactivity before the controller initiates a pulse   
+#define ACTIVE_SECS    12  // period of activity before the controller transitions from !user_active to user_active (inactive)  
+
+bool pulse = false; 
+bool pulse_rising = false;  // true when pulse is rising 
+bool pulse_easing = false;  // true when pulse is easing 
+
+#define BRIGHTNESS_MAX 12       // 0=dim, 15=bright 
+#define BRIGHTNESS_PULSE_MAX 7  // 0=dim, 15=bright 
+#define BRIGHTNESS_RESTING  1   // resting (inactive) brightness setting
+#define PULSE_RATE          12  // seconds between pulses when inactive 
+int br = BRIGHTNESS_RESTING;
+
+// Pip, Roger beep and CW ident defines
+#define PIP_HZ 770
+#define PIP_DURN_MS 100
+
+#define CW_TONE_HZ 500
+#define CW_DASH_LEN  3      // length of dash (in dots)
+#define PIN_TONE_OUT 6      // piezo/buzzer/transducer on this Arduino digital pin
+#define CW_IDENT_PERIOD 120  // period of CW ident in seconds 
+// #define CW_IDENT_PERIOD 60  // period of CW ident in seconds 
+int dot_length_ms = 45;     // keyer base speed (60 equates to 10 w.p.m.)
+int freq=PIP_HZ;            // freq of the second pip
+unsigned long ident_timer = 0;   // used to time duration in mS of the ident sequence  
+
+
+
+
+
+
+ISR(PCINT2_vect) {
+  unsigned char result = r.process();
+  if (result == DIR_CW)
+    set_frequency(1);
+  else if (result == DIR_CCW)
+    set_frequency(-1);
+}
+
+void set_frequency(short dir){
+  if(mode_tx) return;  // dial locks in transmit
+
+  if (dir == 1) VFOSet[v].vfo += VFOSet[v].radix;
+  else 
+     if (dir == -1) VFOSet[v].vfo -= VFOSet[v].radix; 
+
+  changed_f = true;
+  user_active = true;   
+};
+
+
+
+bool read_pushbutton(byte pin, bool active_high)
+{
+  // see if pushbutton on digital input 'pin' is being pressed
+  // 'active_low' means pushbutton is normally open 
+
+  bool ret = false; 
+  if(active_high && digitalRead(pin)){      
+    while(digitalRead(pin)) ;
+    user_active = true;   
+    Serial.println("wake up!");
+    return true;
+  }
+  
+  if(!active_high && !digitalRead(pin)){      
+    while(!digitalRead(pin)) ;   
+    user_active = true;   
+    Serial.println("wake up!");
+    return true;
+  }
+  return false; 
+}
+
+
+/*
+void display_test(){
+  
+  Serial.println("Voltmeter");
+  for (int i = 0; i < 100; i++)
+  {
+    float voltage = analogRead(A0) * 5.0 / 1023;
+    display_left.displayFloat(voltage);
+    delay(100);
+  }
+
+  Serial.println("blink()");
+  for (uint8_t i = 0; i < 3; i++)
+  {
+    display_left.blink(i);
+    delay(4000);
+  }
+  display_left.blink(0);
+}
+*/
+
+
+uint8_t toRaw(int n, bool dot){
+  // maps an integer 0..9 to a raw format for the LED display;
+  // if 'dot', include the dot segment 
+  
+  uint8_t r;
+
+  uint8_t table[] = {0x3F, // 0
+                    0x06,  // 1
+                    0x5B,  // 2
+                    0x4F,  // 3
+                    0x66,  // 4
+                    0x6D,  // 5
+                    0x7D,  // 6
+                    0x07,  // 7
+                    0x7F,  // 8
+                    0x6F   // 9 
+                    };
+  r = table[n];
+  if (dot) return r | 0b10000000;
+  return r;
+}
+
+
+void transmit_timer_increment(int increment)
+{
+  // increase the transmit second timer by 'increment' 
+
+  for (byte n=0; n< increment; n++){
+    transmit_timer_s++;
+    if(transmit_timer_s == 60){
+      transmit_timer_s = 0;
+      transmit_timer_m++;
+    } // if
+  } // for
+} 
+
+
+
+void display_temperature()
+{
+  // put the temp on the right display 
+
+  float c = tempSensor.readTempC();
+  //  String s(c);
+  //  String C_str = s.substring(0, s.indexOf('.')+2) + "C";
+  //  Serial.print("C_str: "); Serial.println(C_str);
+  delay(10);
+
+  int c_int = c *10;                      // convert temp to integer times 10 
+  int tens = c_int/100;                  // get tens as single digit 
+  int units = (c_int - (tens*100))/10;   // get units as single digit 
+  int tenths = c_int - (tens*100) - (units*10);  // get tenths as single digit 
+  //  Serial.print("  tens ="); Serial.println(tens); 
+  //  Serial.print("  units =");Serial.println(units); 
+  //  Serial.print("  tenths ="); Serial.println(tenths); 
+  
+  uint8_t arr[] = { 0x00, 0x00, 0x00, 0x63};   // 0x39 is 'C'    0x58 is 'c'  0x63 is degrees symbol  
+
+  arr[0] = toRaw(tens, false); 
+  arr[1] = toRaw(units, true); 
+  arr[2] = toRaw(tenths, false); 
+
+  display_right.displayRaw(arr);
+  display_right.displayColon(false);
+}
+
+
+void display_transmit_timer()
+{
+  // in transmit mode, display the transmit timer on the right display 
+
+  display_right.displayTime(transmit_timer_m, transmit_timer_s);
+  display_right.displayColon(true);
+}
+
+
+
+void update_left_display()
+{
+  // updates the left display (only the VFO frequency)
+  
+  uint16_t f;
+  f = VFOSet[v].vfo/1000;   // frequency in whole Hz
+  float ff = float(f); 
+  display_left.displayFloat(ff/1000.0);   // display the VFO frequency 
+}
+
+
+
+void receive_to_TRANSMIT()
+{
+  // handles receive to transmit sequencing, called when the PTT line goes low  
+  // r->T sequence: mute receiver
+  // engage T/R relay
+  // enable PWM (which turns on the RF drive)
+  // initialise the transmit timer 
+  // reset the display 
+  //   - left, leave on VFO frequency but blink display
+  //   - right, alternate between temp and transmit timer at 2s interval 
+
+  mode_tx = true; 
+  user_active = true;  // we want the displays on full dirng transmit 
+  
+  // initialise the transmit timer 
+  transmit_timer_m = 0;
+  transmit_timer_s = 0;
+     
+  // display (left), turn blink on  
+  display_left.blink(2);   // tune the '3' blink rate
+ 
+  // the main loop will handle display (right), alternate between temp and transmit timer, start with temp  
+
+  // mute the receiver
+  digitalWrite(MUTE_LINE, 1);
+
+  // engage TR relay
+  digitalWrite(TRANSMIT_LINE, 1);
+  delay(200); 
+  
+  // enable PWM
+  digitalWrite(PWM_ENABLE, 1);  
+  delay(200); 
+
+  // turn VFO on 
+  si5351.set_freq(VFOSet[v].vfo * SI5351_FREQ_MULT, SI5351_CLK0); 
+  si5351.output_enable(SI5351_CLK0, 1);  // turn VFO on 
+  delay(200); 
+
+  pip(PIP_HZ, PIP_DURN_MS);  // make an audible pip
+
+}
+
+
+
+void TRANSMIT_to_receive()
+{
+  // handles transmit to receive sequencing, called when the PTT line goes high    
+
+  mode_tx = false; 
+  user_active = true;  // let the display stay on for a while  
+  
+  display_left.blink(0);   // stop blinking 
+
+  over_beep();
+  delay(800);
+ 
+  // turn VFO off 
+  si5351.output_enable(SI5351_CLK0, 0);  
+  delay(100);
+
+  // disable PWM
+  digitalWrite(PWM_ENABLE, 0);
+  delay(200);
+
+  // dis-engage TR relay
+  digitalWrite(TRANSMIT_LINE, 0);
+  delay(200); 
+
+  // un-mute the receiver
+  digitalWrite(MUTE_LINE, 0);
+ 
+}
+
+
+// ------------------------------------------------------------------------------------------------------------------
+// EEPROM
+
+void update_eeprom()
+{
+  // do the eeprom write
+  // Serial.println("*** eeprom write");
+
+  Serial.println("update_eeprom()");
+
+  EEPROM.write(0, v);   // write the band index (v) to the first byte
+        
+  int element_len = sizeof(VFOset_type);
+  for(int i=0; i<NBR_VFOS ; i++)    // write each element of the VFOSet array
+  {
+    EEPROM.put(1 + (i * element_len), VFOSet[i]);
+  }
+};
+
+//-----------------------------------------------------------------------------------------
+// CW ident
+
+
+
+void pip(int hz, int ms)
+{
+  tone(PIN_TONE_OUT, hz); 
+  delay(ms);        
+  noTone(PIN_TONE_OUT);      
+}
+
+
+void send_dot() {
+  delay(dot_length_ms);  // wait for one dot period (space)
+  tone(PIN_TONE_OUT, CW_TONE_HZ);
+  Serial.print(".");
+  delay(dot_length_ms);  // key down for one dot period
+  noTone(PIN_TONE_OUT);
+}
+
+
+void send_dash() {
+  delay(dot_length_ms);  // wait for one dot period (space)
+  tone(PIN_TONE_OUT, CW_TONE_HZ);
+  Serial.print("-");
+  delay(dot_length_ms * CW_DASH_LEN);  // key down for CW_DASH_LEN dot periods
+  noTone(PIN_TONE_OUT);
+}
+
+void send_letter_space() {
+  delay(dot_length_ms * 3);  // wait for 3 dot periods
+  Serial.print(" ");
+}
+
+void over_beep(){
+  send_dash();
+  send_dot();
+  send_dash();
+}
+
+void send_id(){
+  // senf the callsign ident, on te TONE digital pin
+  // correct the transmit timer for the time spent while ident runs
+
+  if(!mode_tx) return;
+  
+  ident_timer = millis();
+  
+  send_dot(); send_dot(); send_dot(); send_dash();  // V
+  send_letter_space();
+  send_dash();   send_dot();   send_dash();         // K
+  send_letter_space();
+  send_dot(); send_dot(); send_dot(); send_dash(); send_dash(); // 3
+  send_letter_space();
+  send_dot(); send_dot(); send_dot(); send_dot();   // H
+  send_letter_space();
+  send_dash(); send_dot();                          // N
+  
+//  Serial.println();
+  ident_timer = abs(millis() - ident_timer);
+//  Serial.print("Durn=");
+//  Serial.print((int)ident_timer);
+  
+  int r = round(float(ident_timer)/1000.0);
+//  Serial.print(", "); Serial.println(r);
+
+  // increase the transmit timer by the number of seconds that passed while the CW ident was controlling the CPU  
+  transmit_timer_increment(r);             
+}
+//-----------------------------------------------------------------------------------------
+
+
+
+
+void setup()
+{
+  Serial.begin(9600);
+  Serial.println(__FILE__);
+
+  display_left.begin();
+  display_right.begin();
+//  Wire.setClock(100000);
+  Wire.begin();
+
+  display_left.displayOn();
+  Serial.println("displayTest()");
+  display_left.displayTest(2);
+  display_left.displayOff();
+
+  display_right.displayOn();
+  display_right.displayTest(2);
+  display_right.displayOff();
+  
+  display_left.displayOn();  
+  display_right.displayOn();
+  display_left.displayClear();
+  display_right.displayClear();
+
+  display_left.brightness(BRIGHTNESS_MAX);
+  display_right.brightness(BRIGHTNESS_MAX);
+
+
+//  set up the temp sensor
+  byte n=0;
+  while ((!tempSensor.begin()) && n<5) {
+    Serial.println("MCP9808 err");
+    delay(200);
+    n++;
+  };
+  
+
+// set digital pins
+  pinMode(PTT_SENSE, INPUT_PULLUP);  // senses the PTT switch in the microphone, normally open, grounded when PTT pressed
+  
+  pinMode(MUTE_LINE, OUTPUT); 
+  digitalWrite(MUTE_LINE, 0);     // put the mute line low (un-mute)  
+  
+  pinMode(TRANSMIT_LINE, OUTPUT); 
+  digitalWrite(TRANSMIT_LINE, 0); // put the transmit line low (relay not energised)
+
+  pinMode(BAND_80, OUTPUT);    // band relay line 
+  pinMode(PWM_ENABLE, OUTPUT);    
+
+  pinMode(PUSHBUTTON_ENCODER, INPUT_PULLUP);   // encoder pushbutton
+  pinMode(PUSHBUTTON_TOP,     INPUT_PULLUP);   // pushbutton
+  pinMode(PUSHBUTTON_BOTTOM,  INPUT_PULLUP);   // pushbutton 
+
+
+// start with transmit line low (in receive) 
+  mode_tx = false;
+  
+  PCICR |= (1 << PCIE2);           // Enable pin change interrupt for the encoder
+  PCMSK2 |= (1 << PCINT18) | (1 << PCINT19);
+  sei();
+  
+  // load up VFOSet array from EEPROM
+
+  v = EEPROM.read(0);
+  Serial.print("setup() eeprom: v=");
+  Serial.println(v);
+  if(v >= NBR_VFOS) v = 1;  // in case NBR_VFOS has been reduced since the last run (EEPROM update)
+  
+  int element_len = sizeof(VFOset_type);
+  for(int i=0; i < NBR_VFOS; i++)
+  {
+    EEPROM.get(1 + (i * element_len), VFOSet[i]);
+  };
+
+  
+
+  // initialise the si5351 clock (VFO)
+
+  si5351.init(SI5351_CRYSTAL_LOAD_8PF, 0, 0); // If using 27Mhz xtal, put 27000000 instead of 0 (0 is the default xtal freq of 25Mhz)
+  
+  si5351.set_correction(10000);    
+                                    
+  si5351.set_pll(SI5351_PLL_FIXED, SI5351_PLLA);
+  
+//  si5351.set_freq((VFOSet[v].vfo) * SI5351_FREQ_MULT, SI5351_CLK0);    // set CLK0 to  VFO freq for current band 
+//  si5351.drive_strength(SI5351_CLK0, SI5351_DRIVE_2MA); 
+  
+  si5351.output_enable(SI5351_CLK0, 0);  // turn off 
+
+  si5351.output_enable(SI5351_CLK1, 0);  // turn off 
+  si5351.output_enable(SI5351_CLK2, 0);  // turn off 
+
+//  Serial.print("v ="); Serial.println(v); 
+//  Serial.print("VFOSet[v].vfo ="); Serial.println(VFOSet[v].vfo); 
+
+// initialise the RTC
+  rtc.begin();
+  if (! rtc.isrunning()) {
+    Serial.println("RTC is NOT running!");
+    // following line sets the RTC to the date & time this sketch was compiled
+    rtc.adjust(DateTime(__DATE__, __TIME__));
+  };
+  // to set the RTC, un-comment this line and it will take the host PC's date time: 
+  // rtc.adjust(DateTime(__DATE__, __TIME__));
+  // compile and download, then, comment it and download again!
+
+  changed_f = true;  // to prime the display, first time only 
+
+}
+
+
+
+void loop()
+{
+  // see if it is time to sleep 
+  if(!mode_tx && user_active && (activity_ticks % ACTIVE_SECS == 0)) {
+    user_active = false; // transition from active to inactive 
+    activity_ticks = 1;
+//    Serial.println("going to sleep. ");
+  }
+  
+  // check the pushbuttons and respond if one has been pushed 
+  if(read_pushbutton( PUSHBUTTON_TOP, true)) 
+  {
+    // handle top pushbutton
+    Serial.println("top button");
+    //    receive_to_TRANSMIT();
+    // toggle the band 
+    if(band160){
+      // we are on 160, so pull in the relays for 80
+      band160 = false; 
+      digitalWrite(BAND_80, 1);
+      delay(50);
+      v = 1;    // VFO slot 1 is the 80m VFO 
+      changed_f = true;
+    }
+    else
+    {
+      // we are on 80, so drop the relays 
+      band160 = true; 
+      digitalWrite(BAND_80, 0);
+      delay(50);
+      v = 0;    // VFO slot 0 is the 160m VFO 
+      changed_f = true;
+    }
+    
+  }
+  
+  if(read_pushbutton(PUSHBUTTON_BOTTOM, true)) 
+  {
+    // handle bottom pushbutton
+    Serial.println("bottom button");
+    // TRANSMIT_to_receive();
+
+
+  }
+  
+  if(read_pushbutton(PUSHBUTTON_ENCODER, false)) 
+  {
+    // handle encoder pushbutton
+    Serial.println("encoder button");
+
+  }
+  
+
+  // see if PTT (or equivalent Tx switch) has been pressed
+  if(!mode_tx && !digitalRead(PTT_SENSE)) 
+  {
+    // PTT just pressed
+    receive_to_TRANSMIT(); 
+  };
+
+
+  if(mode_tx && digitalRead(PTT_SENSE)) 
+  {
+    // PTT has been released 
+    TRANSMIT_to_receive(); 
+  }
+
+  
+  delay(50);   // timing delay added for the pulse cycle 
+
+  // see if it is a second boundary 
+  this_mS = millis(); 
+  if(abs(this_mS - last_mS)>1000)
+  {
+    last_mS = this_mS;
+    tick++;             // tick is the second counter 
+    if(mode_tx) transmit_timer_increment(1);  // if transmitting, increment the transmit counter 
+    //    Serial.print("."); 
+    
+    if(user_active)
+      activity_ticks++;
+    else
+      inactivity_ticks++;
+  }
+  //  Serial.print("inactivity_ticks="); Serial.println(inactivity_ticks); 
+
+  // in we are sleeping, see if it is time to commence a pulse...
+  if(!user_active && !pulse && ((inactivity_ticks%PULSE_RATE) == 0)) 
+  {
+    // every n ticks during an inactive period, pulse
+    // Serial.println(" pulse begins"); 
+    pulse = true; 
+    br = BRIGHTNESS_RESTING;
+  }
+
+  // if pulsing, increment or decrement the brightness to make the pulse effect 
+  if(pulse){
+    if((br <= BRIGHTNESS_PULSE_MAX) && !pulse_easing) br++;  // pulse is building 
+    else {
+      pulse_easing = true; 
+      br--;   // pulse easing 
+    };
+    delay(70);
+  }
+
+  // if the rig is being used, (user_active) we want full brightness 
+  if(user_active) br = BRIGHTNESS_MAX;  
+  
+  //  Serial.print("br="); Serial.println(br);
+  display_left.brightness(br);    
+  display_right.brightness(br);
+  
+  // see if it is time to end the pulse 
+  if(pulse && (br == BRIGHTNESS_RESTING)) 
+  {
+    //  Serial.println(" pulse ends"); 
+    pulse = false;
+    // pulse_rising = false;
+    pulse_easing = false;
+  }
+  
+  
+  // if the encoder was touched since last iteration, perform any VFO and frequency display updates
+  if(changed_f){
+    changed_f = false;   // reset changed flag 
+    user_active = true;  // wake up 
+
+    update_left_display();
+    //  inactivity_ticks = 1; // not 0, to avoid triggering first time
+
+    // set eeprom update flag so that after a fixed period of time the eeprom write will be done   
+    last_freq_change_mS = millis();
+    update_eeprom_flag = true;  
+  }
+
+  // if the encoder has not been touched for a while, refresh the frequency information into EEPROM
+  this_mS = millis();
+  if(update_eeprom_flag && (abs(this_mS - last_freq_change_mS) > EEPROM_UPDATE_LAG_MS))    
+  {  
+    update_eeprom(); 
+    update_eeprom_flag = false; 
+  }
+
+  // if transmitting, alternate the right display between transmit timer and temperature 
+  if(mode_tx)
+  {
+    // in transmit mode
+    int j = transmit_timer_s%10; 
+    // in seconds 0 to 6, display transmit timer
+    // in seconds 7 to 9, display the temperature 
+    if(j <= 6) 
+      display_transmit_timer();
+    else 
+      display_temperature();
+  }
+  else
+  {
+    // in receive mode
+    // update the real time (MM:SS) on the right display 
+    DateTime now = rtc.now();
+ /*   
+    Serial.print(now.year(), DEC);     Serial.print('/');
+    Serial.print(now.month(), DEC);    Serial.print('/');
+    Serial.print(now.day(), DEC);
+    Serial.print(' ');
+    Serial.print(now.hour(), DEC);     Serial.print(':');
+    Serial.print(now.minute(), DEC);   Serial.print(':');
+    Serial.print(now.second(), DEC);
+    Serial.println();
+ */   
+
+    byte h = (byte)(now.hour());  
+    byte m = (byte)now.minute(); 
+    byte s = (byte)now.second(); 
+    //  Serial.print("  h="); Serial.print((int)h); 
+    //  Serial.print("  m="); Serial.print((int)m); 
+    //  Serial.print("  s="); Serial.println((int)s); 
+
+    display_right.displayTime(h, m);
+    if(s%2 == 0)                            
+      display_right.displayColon(true);  // blink the colon at 1 second intervals 
+    else
+      display_right.displayColon(false);
+  }
+
+  // if transmitting, and sufficient time has passed, sound the CW ident 
+  if(mode_tx && ((transmit_timer_s+1)%CW_IDENT_PERIOD == 0)) send_id();  // careful, this will block here until done
+}
+
+// -- END OF FILE --
